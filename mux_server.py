@@ -2,143 +2,168 @@
 
 import sys, os
 import select, socket, serial
-import optparse
 
+_default_host = 'localhost'
+_default_port = 23200
 
-# Option parsing, duh
-parser = optparse.OptionParser()
+_default_device = '/dev/ttyS0'
+_default_baudrate = 9600
+_default_width = serial.EIGHTBITS
+_default_parity = serial.PARITY_NONE
+_default_stopbits = serial.STOPBITS_ONE
+_default_xon = 0
+_default_rtc = 0
 
-parser.add_option('-d',
-				'--device',
-				help = 'Serial port device',
-				dest = 'device',
-				default = '/dev/ttyS0')
-parser.add_option('-b',
-				'--baud',
-				help = 'Baud rate',
-				dest = 'baudrate',
-				type = 'int',
-				default = 9600)
-parser.add_option('-p',
-				'--port',
-				help = 'Host port',
-				dest = 'port',
-				type = 'int',
-				default = 23200)
+_READ_ONLY = select.POLLIN | select.POLLPRI
 
-(opts, args) = parser.parse_args()
+class MuxServer(object):
+	def __init__(self,
+				host=_default_host,
+				port=_default_port,
+				device = _default_device,
+				baudrate=_default_baudrate,
+				width = _default_width,
+				parity = _default_parity,
+				stopbits = _default_stopbits,
+				xon = _default_xon,
+				rtc = _default_rtc,):
+		self.host = host
+		self.port = port
+		self.device = device
+		self.baudrate = baudrate
+		self.width = width
+		self.parity = parity
+		self.stopbits = stopbits
+		self.xon = xon
+		self.rtc = rtc
 
+		self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		self.server.setblocking(0)
 
-# Serial port setup
-width = 8
-parity = 'N'
-stopbits = 1
-xon = 0
-rtc = 0
+		self.poller = select.poll()
 
-ttyS = serial.Serial(opts.device, opts.baudrate, width, parity, stopbits, 1, xon, rtc)
-ttyS.setTimeout(0) # Non-blocking
-ttyS.flushInput()
-ttyS.flushOutput()
+		self.fd_to_socket = {}
+		self.clients = []
 
-print >>sys.stderr, 'MUX > Serial port: %s @ %s' % (opts.device, opts.baudrate)
-
-
-# Server setup
-server_address = ('localhost', opts.port)
-
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.setblocking(0)
-server.bind(server_address)
-server.listen(5)
-
-print >>sys.stderr, 'MUX > Server: %s:%d' % server_address
-
-
-# Poller setup
-READ_ONLY = select.POLLIN | select.POLLPRI
-
-poller = select.poll()
-poller.register(ttyS, READ_ONLY)
-poller.register(server, READ_ONLY)
-
-
-# Convenience lists
-# Easy file descriptor-to-socket dict
-fd_to_socket = {ttyS.fileno(): ttyS,
-				server.fileno(): server,
-				}
-
-# Connected clients list
-clients = []
-
-
-def add_client(client):
-	print >>sys.stderr, 'MUX > New connection from', client.getpeername()
-	client.setblocking(0)
-	fd_to_socket[client.fileno()] = client
-	clients.append(client)
-	poller.register(client, READ_ONLY)
-
-
-def remove_client(client, why='?'):
-	print >>sys.stderr, 'MUX > Closing %s: %s' % (client.getpeername(), why)
-	poller.unregister(client)
-	clients.remove(client)
-	client.close()
-
-
-##### MAIN
-while True:
-	try:
-		events = poller.poll(500)
-
-		for fd, flag in events:
-
-			# Get socket from fd
-			s = fd_to_socket[fd]
-
-			if flag & (select.POLLIN | select.POLLPRI):
-
-				# A readable server socket is ready to accept a connection
-				if s is server:
-					connection, client_address = s.accept()
-					add_client(connection)
-
-				# Data from serial port
-				elif s is ttyS:
-					data = s.read(80)
-					#print >>sys.stderr, 'MUX > Data from serial:', data
-					if clients:	[client.send(data) for client in clients]
-
-				# Data from client
-				else:
-					data = s.recv(80)
-					#print >>sys.stderr, 'MUX > Data from client:', data
-
-					# Client has data
-					if data: ttyS.write(data)
-
-					# Interpret empty result as closed connection
-					else: remove_client(s, 'Got no data')
-
-
-			elif flag & select.POLLHUP:
-				remove_client(s, 'HUP')
-
-
-			elif flag & select.POLLERR:
-				remove_client(s, 'Received error')
-
-
-	except (KeyboardInterrupt, SystemExit):
+	def close(self):
 		print >>sys.stderr, '\nMUX > Closing...'
-		break;
 
-if clients:
-	[client.close() for client in clients]
+		for client in self.clients:
+			client.close()
+		self.tty.close()
+		self.server.close()
 
-ttyS.close()
-server.close()
+		print >>sys.stderr, 'MUX > Done! =)'
 
-print >>sys.stderr, 'MUX > Done! =)'
+	def add_client(self, client):
+		print >>sys.stderr, 'MUX > New connection from', client.getpeername()
+		client.setblocking(0)
+		self.fd_to_socket[client.fileno()] = client
+		self.clients.append(client)
+		self.poller.register(client, _READ_ONLY)
+
+	def remove_client(self, client, why='?'):
+		try:
+			name = client.getpeername()
+		except:
+			name = 'client %d' % client.fileno()
+		print >>sys.stderr, 'MUX > Closing %s: %s' % (name, why)
+		self.poller.unregister(client)
+		self.clients.remove(client)
+		client.close()
+
+	def run(self):
+		try:
+			self.tty = serial.Serial(self.device, self.baudrate,
+									self.width, self.parity, self.stopbits,
+									1, self.xon, self.rtc)
+			self.tty.setTimeout(0) # Non-blocking
+			self.tty.flushInput()
+			self.tty.flushOutput()
+			self.poller.register(self.tty, _READ_ONLY)
+			self.fd_to_socket[self.tty.fileno()] = self.tty
+			print >>sys.stderr, 'MUX > Serial port: %s @ %s' % (self.device, self.baudrate)
+
+			self.server.bind((self.host, self.port))
+			self.server.listen(5)
+			self.poller.register(self.server, _READ_ONLY)
+			self.fd_to_socket[self.server.fileno()] = self.server
+			print >>sys.stderr, 'MUX > Server: %s:%d' % self.server.getsockname()
+
+			print >>sys.stderr, 'MUX > Use ctrl+c to stop...\n'
+
+			while True:
+				events = self.poller.poll(500)
+				for fd, flag in events:
+					# Get socket from fd
+					s = self.fd_to_socket[fd]
+
+					if flag & select.POLLHUP:
+						self.remove_client(s, 'HUP')
+
+					elif flag & select.POLLERR:
+						self.remove_client(s, 'Received error')
+
+					elif flag & (_READ_ONLY):
+						# A readable server socket is ready to accept a connection
+						if s is self.server:
+							connection, client_address = s.accept()
+							self.add_client(connection)
+
+						# Data from serial port
+						elif s is self.tty:
+							data = s.read(80)
+							for client in self.clients:
+								client.send(data)
+
+						# Data from client
+						else:
+							data = s.recv(80)
+
+							# Client has data
+							if data: self.tty.write(data)
+
+							# Interpret empty result as closed connection
+							else: self.remove_client(s, 'Got no data')
+
+		except serial.SerialException, e:
+			print >>sys.stderr, '\nMUX > Serial error: "%s". Closing...' % e
+
+		except socket.error, e:
+			print >>sys.stderr, '\nMUX > Socket error: %s' % e.strerror
+
+		except (KeyboardInterrupt, SystemExit):
+			pass
+
+		finally:
+			self.close()
+
+
+if __name__ == '__main__':
+	import optparse
+
+	# Option parsing, duh
+	parser = optparse.OptionParser()
+	parser.add_option('-d',
+					'--device',
+					help = 'Serial port device',
+					dest = 'device',
+					default = _default_device)
+	parser.add_option('-b',
+					'--baud',
+					help = 'Baud rate',
+					dest = 'baudrate',
+					type = 'int',
+					default = _default_baudrate)
+	parser.add_option('-p',
+					'--port',
+					help = 'Host port',
+					dest = 'port',
+					type = 'int',
+					default = _default_port)
+	(opts, args) = parser.parse_args()
+
+	s = MuxServer(port = opts.port,
+				device = opts.device,
+				baudrate = opts.baudrate)
+	s.run()
